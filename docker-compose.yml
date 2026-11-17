@@ -1,7 +1,29 @@
 name: edge-gateway-demo
 
+# The two gateways share one SQLite file (the `gateway-data` volume), so they
+# must have distinct, stable GATEWAY_IDs. Set BETA_URL to rehearse an address
+# change for the `beta` target, e.g.:
+#   BETA_URL=http://upstream-beta-alt:8000 docker compose up --build
+# With BETA_URL unset the address is unchanged and a restart keeps probes.
+
+x-gateway-env: &gateway-env
+  UPSTREAMS: "alpha=http://upstream-alpha:8000;beta=${BETA_URL:-http://upstream-beta:8000}"
+  INITIAL_TARGET: alpha
+  GATEWAY_DB: /data/gateway.db
+  # Probes stay valid this long; an address change invalidates them at once.
+  PROBE_TTL_SECONDS: "60"
+
+x-gateway-common: &gateway-common
+  build: ./gateway
+  volumes:
+    - gateway-data:/data
+  depends_on:
+    - upstream-alpha
+    - upstream-beta
+    - upstream-beta-alt
+
 services:
-  upstream-a:
+  upstream-alpha:
     build: ./upstream
     environment:
       UPSTREAM_NAME: alpha
@@ -9,7 +31,7 @@ services:
     ports:
       - "9001:8000"
 
-  upstream-b:
+  upstream-beta:
     build: ./upstream
     environment:
       UPSTREAM_NAME: beta
@@ -17,20 +39,31 @@ services:
     ports:
       - "9002:8000"
 
-  gateway:
-    build: ./gateway
+  # Replacement address for the `beta` target; demonstrates that a probe made
+  # against the old address cannot authorise this one.
+  upstream-beta-alt:
+    build: ./upstream
     environment:
-      # 已登记的上游清单；启动时写入 SQLite，重启后按已登记路由接流量
-      UPSTREAMS: "alpha=http://upstream-a:8000;beta=http://upstream-b:8000"
-      INITIAL_TARGET: alpha
-      GATEWAY_DB: /data/gateway.db
+      UPSTREAM_NAME: beta-alt
+      DEFAULT_DELAY_MS: "500"
+    ports:
+      - "9003:8000"
+
+  gateway-a:
+    <<: *gateway-common
+    environment:
+      <<: *gateway-env
+      GATEWAY_ID: gateway-a
     ports:
       - "8080:8000"
-    volumes:
-      - gateway-data:/data
-    depends_on:
-      - upstream-a
-      - upstream-b
+
+  gateway-b:
+    <<: *gateway-common
+    environment:
+      <<: *gateway-env
+      GATEWAY_ID: gateway-b
+    ports:
+      - "8081:8000"
 
 volumes:
   gateway-data:

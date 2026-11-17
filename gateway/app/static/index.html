@@ -71,9 +71,12 @@
   <section>
     <h2>上游与在途数</h2>
     <table>
-      <thead><tr><th>名称</th><th>地址</th><th>角色</th><th>在途</th><th>状态</th></tr></thead>
+      <thead><tr><th>名称</th><th>地址</th><th>登记修订</th><th>角色</th><th>在途</th><th>状态</th></tr></thead>
       <tbody id="upstream-body"></tbody>
     </table>
+    <div class="muted" style="margin-top:8px">
+      地址每次变化都会使该目标的既有探测失效（改回旧地址也不复用），需重新探测后才能确认。
+    </div>
   </section>
 
   <section>
@@ -84,7 +87,7 @@
 
 <script>
 let state = null;
-let lastProbe = null;   // {target, base_version, probe_id, ok}
+let lastProbe = null;   // {target, url, upstream_revision, base_version, probe_id, ok}
 let reqSeq = 0;
 const $ = (id) => document.getElementById(id);
 
@@ -111,37 +114,70 @@ async function refresh() {
 
 function render() {
   const r = state.route;
-  let html = `当前目标 <b>${esc(r.current_target)}</b> · 路由版号 <b>v${r.version}</b> · ` +
+  let html = `当前目标 <b>${esc(r.current_target)}</b>` +
+             `${r.current_url ? ' · 生效地址 <b>' + esc(r.current_url) + '</b>' : ''} · ` +
+             `路由版号 <b>v${r.version}</b> · ` +
              `更新于 ${new Date(r.updated_at * 1000).toLocaleTimeString()}`;
+  if (r.url_matches_registration === false)
+    html += ` · <span style="color:#ffd166">注意：登记地址 ${esc(r.registered_url || '（无）')} ` +
+            `r${r.registered_revision ?? '?'} 与生效地址不一致，需探测新地址后确认</span>`;
   if (state.boot && state.boot.cleared_inflight)
     html += ` · 本次启动已清理中断在途 ${state.boot.cleared_inflight} 条`;
   $('route-summary').innerHTML = html;
 
   $('upstream-body').innerHTML = state.upstreams.map(u => {
     let cls, badge;
-    if (u.is_current)      { cls = 'cur';        badge = '<span class="badge cur">当前目标</span>'; }
-    else if (u.inflight>0) { cls = 'draining';   badge = `<span class="badge draining">旧目标 · 排空中</span>`; }
-    else                   { cls = 'offlinable'; badge = '<span class="badge offlinable">旧目标 · 在途已清零，可下线 ✓</span>'; }
+    if (u.is_current && u.url === r.current_url) {
+      cls = 'cur'; badge = '<span class="badge cur">当前目标</span>';
+    } else if (u.is_current) {
+      cls = 'draining';
+      badge = `<span class="badge draining">当前目标 · 登记地址已变更，待探测确认</span>`;
+    } else if (u.inflight>0) {
+      cls = 'draining'; badge = `<span class="badge draining">旧目标 · 排空中</span>`;
+    } else {
+      cls = 'offlinable'; badge = '<span class="badge offlinable">旧目标 · 在途已清零，可下线 ✓</span>';
+    }
     return `<tr class="${cls}"><td>${esc(u.name)}</td><td>${esc(u.url)}</td>` +
+           `<td>r${u.revision}</td>` +
            `<td>${u.is_current ? '当前' : '旧'}</td><td>${u.inflight}</td><td>${badge}</td></tr>`;
   }).join('');
 
   const sel = $('candidate');
   const prev = sel.value;
-  sel.innerHTML = state.upstreams.filter(u => !u.is_current)
-    .map(u => `<option value="${esc(u.name)}">${esc(u.name)}</option>`).join('');
+  // A current target whose registered address moved is a valid candidate too:
+  // confirming a probe of the new address is how it gets adopted.
+  sel.innerHTML = state.upstreams
+    .filter(u => !u.is_current || u.url !== r.current_url)
+    .map(u => `<option value="${esc(u.name)}">${esc(u.name)} · ${esc(u.url)} r${u.revision}` +
+              `${u.is_current ? '（当前目标新地址，待确认）' : ''}</option>`).join('');
   if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
 
   $('inflight-list').innerHTML = state.inflight.map(x =>
-    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)} · 已进行 ${x.age_ms}ms</li>`
+    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)}` +
+    `${x.url && x.url !== (state.upstreams.find(u => u.name === x.target)||{}).url
+        ? ' · 绑定地址 ' + esc(x.url) : ''} · 已进行 ${x.age_ms}ms</li>`
   ).join('') || '<li class="muted">（无在途请求）</li>';
 
-  $('probe-log').innerHTML = state.recent_probes.map(p =>
-    `<li>${new Date(p.created_at*1000).toLocaleTimeString()} 探测 <b>${esc(p.target)}</b> ` +
-    `@页面版号 v${p.base_version} → ${p.ok ? '成功' : '失败 ' + esc(p.detail.error || JSON.stringify(p.detail))}</li>`
-  ).join('') || '<li class="muted">（暂无）</li>';
+  $('probe-log').innerHTML = state.recent_probes.map(p => {
+    const verdict = p.valid ? '有效' : `失效（${probeReasonText(p.invalid_reasons)}）`;
+    const src = p.ok ? '成功' : '失败 ' + esc(p.detail.error || JSON.stringify(p.detail));
+    return `<li>${new Date(p.created_at*1000).toLocaleTimeString()} 探测 <b>${esc(p.target)}</b> ` +
+      `${p.url ? esc(p.url) : ''} r${p.upstream_rev ?? '?'} @页面版号 v${p.base_version} → ${src} · ${verdict}</li>`;
+  }).join('') || '<li class="muted">（暂无）</li>';
 
   updateSwitchPanel();
+}
+
+const PROBE_REASONS = {
+  probe_not_successful: '探测未成功',
+  address_changed: '地址已变化',
+  route_version_changed: '路由版号已变化',
+  probe_expired: '探测已过期',
+  probe_base_version_mismatch: '探测版号不匹配',
+  target_unregistered: '目标未登记',
+};
+function probeReasonText(reasons) {
+  return (reasons || []).map(r => PROBE_REASONS[r] || r).join('、');
 }
 
 function updateSwitchPanel() {
@@ -151,8 +187,10 @@ function updateSwitchPanel() {
   const sameTarget = lastProbe.target === $('candidate').value;
   const versionOk = lastProbe.base_version === state.route.version;
   btn.disabled = !(lastProbe.ok && sameTarget && versionOk);
-  hint.textContent = `页面所见版号 v${state.route.version} · 探测基于版号 v${lastProbe.base_version}` +
-    (versionOk ? '' : '（版号已变化，请重新探测）');
+  let text = `页面所见版号 v${state.route.version} · 探测基于版号 v${lastProbe.base_version}`;
+  if (!versionOk) text += '（版号已变化，请重新探测）';
+  else if (!lastProbe.address_matches) text += '（目标地址已变化，此探测已失效，请重新探测）';
+  hint.textContent = text;
 }
 
 async function doProbe() {
@@ -163,9 +201,13 @@ async function doProbe() {
   const { body } = await api('POST', '/api/switch/probe',
                              { target, base_version: state.route.version });
   lastProbe = body && body.probe_id ? body : null;
-  if (body && body.ok) {
+  if (body && body.error === 'target_is_current') {
+    msg.className = 'msg err';
+    msg.textContent = `当前目标地址未变化，无需重新确认：${target}`;
+  } else if (body && body.ok) {
     msg.className = 'msg ok';
-    msg.textContent = `探测成功：${target} 健康（基于版号 v${body.base_version}），可确认切换`;
+    msg.textContent = `探测成功：${target} 健康（${body.url} r${body.upstream_revision}，基于版号 v${body.base_version}）` +
+      (body.committable ? '，可确认切换' : '，但版号或地址已变化，请重新探测');
   } else {
     msg.className = 'msg err';
     msg.textContent = `探测失败，维持原路由：${body && (body.error || JSON.stringify(body.detail)) || '未知错误'}`;
@@ -183,13 +225,17 @@ async function doCommit() {
   });
   if (status === 200 && body.ok) {
     msg.className = 'msg ok';
-    msg.textContent = `已切换到 ${body.current_target}（新版号 v${body.version}），新请求立即走新目标`;
+    const kind = body.same_target ? '已把当前目标切换到探测确认的新地址' : '已切换';
+    msg.textContent = `${kind} ${body.current_target}（${body.url}，新版号 v${body.version}），新请求立即走新目标`;
   } else if (status === 409) {
     msg.className = 'msg err';
-    msg.textContent = `版号冲突：路由已被他人切换（当前 ${body.current_target} @v${body.current_version}），已刷新，请重新探测`;
+    const why = body && body.reason ? probeReasonText([body.reason]) : '版号冲突';
+    msg.textContent = `切换被拒绝：${why}（当前 ${body.current_target} @v${body.current_version}），路由未改变，已刷新，请重新探测`;
   } else {
     msg.className = 'msg err';
-    msg.textContent = `切换被拒绝：${body && body.error || status}`;
+    const why = body && body.reason ? probeReasonText([body.reason])
+              : (body && body.error) || String(status);
+    msg.textContent = `切换被拒绝：${why}（路由未改变），请重新探测`;
   }
   lastProbe = null;
   await refresh();

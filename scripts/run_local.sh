@@ -29,6 +29,7 @@ start_upstream() { # name port delay
 
 start_gateway() {
   GATEWAY_DB="$WORK/gateway.db" \
+  GATEWAY_ID=local-gateway \
   UPSTREAMS="alpha=http://127.0.0.1:$UP_A_PORT;beta=http://127.0.0.1:$UP_B_PORT;dead=http://127.0.0.1:9" \
   INITIAL_TARGET=alpha \
     "$PY" -m uvicorn app.main:app --app-dir "$ROOT/gateway" \
